@@ -52,7 +52,8 @@ class GitHubPackages
 
   private
 
-  def upload_bottle(user, token, skopeo, formula_name, bottle_hash)
+  def upload_bottle(user, token, skopeo, formula_full_name, bottle_hash)
+    formula_name = File.basename(formula_full_name)
     _, org, repo, = *bottle_hash["bottle"]["root_url"].match(URL_REGEX)
 
     # docker/skopeo insist on lowercase org ("repository name")
@@ -106,7 +107,7 @@ class GitHubPackages
 
       # TODO: ideally most/all of these attributes would be stored in the
       # bottle JSON rather than reading them from the formula.
-      os, arch, formulae_dir = if @bottle_tag.to_s.end_with?("_linux")
+      os, arch, formulae_dir = if bottle_tag.to_s.end_with?("_linux")
         ["linux", "amd64", "formula-linux"]
       else
         os = "darwin"
@@ -181,7 +182,7 @@ class GitHubPackages
     image_tag = "#{image}:#{version_rebuild}"
     puts
     system_command!(skopeo, verbose: true, print_stdout: true, args: [
-      "copy", "--dest-creds=#{user}:#{token}",
+      "copy", "-a", "--dest-creds=#{user}:#{token}",
       "oci:#{root}", "docker://#{image_tag}"
     ])
   end
@@ -224,10 +225,10 @@ class GitHubPackages
     }, "index.json")
   end
 
-  def write_hash(directory, hash, _filename = nil)
+  def write_hash(directory, hash, filename = nil)
     json = hash.to_json
     sha256 = Digest::SHA256.hexdigest(json)
-    path = directory/sha256
+    path = directory/(filename || sha256)
     path.unlink if path.exist?
     path.write(json)
 
