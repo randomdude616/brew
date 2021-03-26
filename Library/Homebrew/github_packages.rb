@@ -108,7 +108,7 @@ class GitHubPackages
     formula_path = HOMEBREW_REPOSITORY/bottle_hash["formula"]["path"]
     formula = Formulary.factory(formula_path)
     formula_name = formula.name
-    
+
     _, org, repo, = *bottle_hash["bottle"]["root_url"].match(URL_REGEX)
 
     # docker/skopeo insist on lowercase org ("repository name")
