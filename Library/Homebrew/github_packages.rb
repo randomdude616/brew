@@ -13,8 +13,9 @@ class GitHubPackages
   include Context
 
   URL_DOMAIN = "ghcr.io"
-  URL_PREFIX = "https://#{URL_DOMAIN}/v2/"
-  URL_REGEX = %r{#{Regexp.escape(URL_PREFIX)}([\w-]+)/([\w-]+)}.freeze
+  API_PREFIX = "https://#{URL_DOMAIN}/v2"
+  DOCKER_PREFIX = "docker://#{URL_DOMAIN}"
+  URL_REGEX = %r{(?:#{Regexp.escape(API_PREFIX)}|#{Regexp.escape(DOCKER_PREFIX)})/([\w-]+)/([\w-]+)}.freeze
 
   sig { returns(String) }
   def inspect
@@ -30,8 +31,8 @@ class GitHubPackages
     ENV["HOMEBREW_FORCE_HOMEBREW_ON_LINUX"] = "1" if @github_org == "homebrew" && !OS.mac?
   end
 
-  sig { params(bottles_hash: T::Hash[String, T.untyped]).void }
-  def upload_bottles(bottles_hash)
+  sig { params(bottles_hash: T::Hash[String, T.untyped], dry_run: T::Bool).void }
+  def upload_bottles(bottles_hash, dry_run:)
     user = Homebrew::EnvConfig.github_packages_user
     token = Homebrew::EnvConfig.github_packages_token
 
@@ -54,7 +55,7 @@ class GitHubPackages
     load_schemas!
 
     bottles_hash.each_value do |bottle_hash|
-      upload_bottle(user, token, skopeo, bottle_hash)
+      upload_bottle(user, token, skopeo, bottle_hash, dry_run: dry_run)
     end
   end
 
@@ -104,7 +105,7 @@ class GitHubPackages
     end
   end
 
-  def upload_bottle(user, token, skopeo, bottle_hash)
+  def upload_bottle(user, token, skopeo, bottle_hash, dry_run:)
     formula_path = HOMEBREW_REPOSITORY/bottle_hash["formula"]["path"]
     formula = Formulary.factory(formula_path)
     formula_name = formula.name
@@ -119,7 +120,7 @@ class GitHubPackages
       ".#{rebuild}"
     end
     version_rebuild = "#{version}#{rebuild}"
-    root = Pathname("#{formula_name}-#{version_rebuild}")
+    root = Pathname("#{formula_name}--#{version_rebuild}")
     FileUtils.rm_rf root
 
     write_image_layout(root)
@@ -132,17 +133,29 @@ class GitHubPackages
     git_revision = formula.tap.git_head
     git_path = formula_path.to_s.delete_prefix("#{formula.tap.path}/")
     source = "https://github.com/#{org}/#{repo}/blob/#{git_revision}/#{git_path}"
+    documentation = if formula.tap.core_tap?
+      "https://formulae.brew.sh/formula/#{formula_name}"
+    else
+      formula.tap.remote
+    end
 
     formula_annotations_hash = {
-      "org.opencontainers.image.description" => formula.desc,
-      "org.opencontainers.image.license"     => formula.license,
-      "org.opencontainers.image.revision"    => git_revision,
-      "org.opencontainers.image.source"      => source,
-      "org.opencontainers.image.url"         => formula.homepage,
-      "org.opencontainers.image.vendor"      => org,
-      "org.opencontainers.image.version"     => version,
+      "org.opencontainers.image.description"   => formula.desc,
+      "org.opencontainers.image.documentation" => documentation,
+      "org.opencontainers.image.license"       => formula.license,
+      "org.opencontainers.image.ref.name"      => version_rebuild,
+      "org.opencontainers.image.revision"      => git_revision,
+      "org.opencontainers.image.source"        => source,
+      "org.opencontainers.image.title"         => formula.full_name,
+      "org.opencontainers.image.url"           => formula.homepage,
+      "org.opencontainers.image.vendor"        => org,
+      "org.opencontainers.image.version"       => version,
     }
+    formula_annotations_hash.each do |key, value|
+      formula_annotations_hash.delete(key) if value.blank?
+    end
 
+    created_times = []
     manifests = bottle_hash["bottle"]["tags"].map do |bottle_tag, tag_hash|
       local_file = tag_hash["local_filename"]
       odebug "Uploading #{local_file}"
@@ -187,6 +200,7 @@ class GitHubPackages
 
       created_time = tab.source_modified_time
       created_time ||= Time.now
+      created_times << created_time
       documentation = "https://formulae.brew.sh/#{formulae_dir}/#{formula_name}" if formula.tap.core_tap?
       tag = "#{version}.#{bottle_tag}#{rebuild}"
       title = "#{formula.full_name} #{tag}"
@@ -196,7 +210,7 @@ class GitHubPackages
         "org.opencontainers.image.documentation" => documentation,
         "org.opencontainers.image.ref.name"      => tag,
         "org.opencontainers.image.title"         => title,
-      }).sort.to_h
+      }.compact).sort.to_h
       annotations_hash.each do |key, value|
         annotations_hash.delete(key) if value.blank?
       end
@@ -226,21 +240,25 @@ class GitHubPackages
         digest:      "sha256:#{manifest_json_sha256}",
         size:        manifest_json_size,
         platform:    platform_hash,
-        annotations: {},
+        annotations: { "org.opencontainers.image.ref.name" => tag },
       }
     end
+    formula_annotations_hash["org.opencontainers.image.created"] = created_times.max.strftime("%F")
 
-    index_json_sha256, index_json_size = write_image_index(manifests, blobs)
+    index_json_sha256, index_json_size = write_image_index(manifests, blobs, formula_annotations_hash)
 
     write_index_json(index_json_sha256, index_json_size, root)
 
-    image = "#{URL_DOMAIN}/#{org}/#{repo}/#{formula_name}"
+    image = "#{DOCKER_PREFIX}/#{org}/#{repo}/#{formula_name}"
     image_tag = "#{image}:#{version_rebuild}"
     puts
-    system_command!(skopeo, verbose: true, print_stdout: true, args: [
-      "copy", "--all", "--dest-creds=#{user}:#{token}",
-      "oci:#{root}", "docker://#{image_tag}"
-    ])
+    args = ["copy", "--all", "oci:#{root}", image_tag.to_s]
+    if dry_run
+      puts "#{skopeo} #{args.join(" ")}"
+    else
+      args << "--dest-creds=#{user}:#{token}"
+      system_command!(skopeo, verbose: true, print_stdout: true, args: args)
+    end
   end
 
   def write_image_layout(root)
@@ -267,14 +285,13 @@ class GitHubPackages
     write_hash(blobs, image_config)
   end
 
-  def write_image_index(manifests, blobs)
-    image_index = {
+  def write_image_index(manifests, blobs, annotations)
+    write_hash(blobs, {
+      mediaType:     "application/vnd.docker.distribution.manifest.list.v2+json",
       schemaVersion: 2,
       manifests:     manifests,
-      annotations:   {},
-    }
-    JSON::Validator.validate!(IMAGE_INDEX_SCHEMA_URI, image_index)
-    write_hash(blobs, image_index)
+      annotations:   annotations,
+    })
   end
 
   def write_index_json(index_json_sha256, index_json_size, root)
